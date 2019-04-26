@@ -38,16 +38,19 @@ var dataReload = false;
 this.setInTime = function(time) {
 	analyserTimeRange.in = time;
 	dataReload = true;
+	cachedCanvas = null;
 	return analyserTimeRange.in;
 };
 this.setOutTime = function(time) {
     if((time - analyserTimeRange.in) <= MAX_ANALYSER_LENGTH) {
         analyserTimeRange.out = time;
         dataReload = true;
+        cachedCanvas = null;
         return analyserTimeRange.out;
     }
 	analyserTimeRange.out = analyserTimeRange.in + MAX_ANALYSER_LENGTH; // 5min
     dataReload = true;
+    cachedCanvas = null;
 	return analyserTimeRange.out;
 };
 	  
@@ -81,6 +84,13 @@ try {
 		fftOutput: 0,
 		maxNoiseIdx: 0
 	};
+
+    var fftThrottleData = {
+            fieldIndex: -1,
+            fftLength: 0,
+            fftOutput: 0,
+            maxNoise: 0,
+        };
 
 	this.setFullscreen = function(size) {
 		isFullscreen = (size==true);
@@ -146,24 +156,102 @@ try {
         }
 		var allChunks = flightLog.getChunksInTimeRange(logStart, logEnd); //Max 300 seconds
 		var samples = new Float64Array(MAX_ANALYSER_LENGTH/1000);
+		var throttle = new Uint16Array(MAX_ANALYSER_LENGTH/1000);
+		var FIELD_THROTTLE_INDEX = flightLog.getMainFieldIndexByName('rcCommands[3]');
 
         // Loop through all the samples in the chunks and assign them to a sample array ready to pass to the FFT.
         fftData.samples	= 0;
 		for (var chunkIndex = 0; chunkIndex < allChunks.length; chunkIndex++) {
 			var chunk = allChunks[chunkIndex];
 			for (var frameIndex = 0; frameIndex < chunk.frames.length; frameIndex++) {
-				samples[fftData.samples++] = (dataBuffer.curve.lookupRaw(chunk.frames[frameIndex][dataBuffer.fieldIndex]));
+				samples[fftData.samples] = dataBuffer.curve.lookupRaw(chunk.frames[frameIndex][dataBuffer.fieldIndex]);
+				throttle[fftData.samples++] = chunk.frames[frameIndex][FIELD_THROTTLE_INDEX]*10;
 			}
 		}
-
+console.time('hanning');
         if(userSettings.analyserHanning) {
             // apply hanning window function
             for(var i=0; i<fftData.samples; i++) {
                 samples[i] *= 0.5 * (1-Math.cos((2*Math.PI*i)/(fftData.samples - 1)));
             }
         }
+console.timeEnd('hanning');
 
-        //calculate fft
+        // vs Throttle graph
+        // Samples for 300ms, window overlapped each 50ms
+        var fftChunkLength = blackBoxRate * 300 / 1000;
+console.time('fft bidi');
+        var matrixFftOutput = new Array(100);  // One for each throttle value, without decimal part
+        var maxNoiseThrottle = 0;
+        var fft = new FFT.complex(fftChunkLength, false);
+        var fftChunkWindow = Math.round(fftChunkLength / 6);
+        var numberSamplesThrottle = new Uint32Array(100);
+        for (var fftChunkIndex = 0; fftChunkIndex + fftChunkLength < samples.length; fftChunkIndex += fftChunkWindow) {
+            var fftInput = samples.slice(fftChunkIndex, fftChunkIndex + fftChunkLength);
+            var fftOutput = new Float64Array(fftChunkLength * 2);
+
+            fft.simple(fftOutput, fftInput, 'real');
+
+            fftOutput = fftOutput.slice(0, fftChunkLength);
+
+            for (var i = 0; i < fftChunkLength; i++) {
+                // Abs value
+                fftOutput[i] = Math.abs(fftOutput[i]);
+                if (fftOutput[i] > maxNoiseThrottle) {
+                    maxNoiseThrottle = fftOutput[i];
+                }
+            }
+
+            var avgThrottle = 0; 
+            for (var indexThrottle = fftChunkIndex; indexThrottle < fftChunkIndex + fftChunkLength; indexThrottle++) {
+                avgThrottle += throttle[indexThrottle];
+            }
+            // Remove de decimal part 
+            avgThrottle = Math.round(avgThrottle / 10 / fftChunkLength);
+
+            numberSamplesThrottle[avgThrottle]++;
+            if (!matrixFftOutput[avgThrottle]) {
+                matrixFftOutput[avgThrottle] = fftOutput;
+            } else {
+                matrixFftOutput[avgThrottle] = matrixFftOutput[avgThrottle].map(function (num, idx) {
+                    return num + fftOutput[idx];
+                });
+            }
+        }
+console.timeEnd('fft bidi');
+
+console.time('average');
+        // Divide by the number of samples
+        for (var i = 0; i < 100; i++) {
+            if (numberSamplesThrottle[i] > 1) {
+                for (var j = 0; j < matrixFftOutput[i].length; j++) {
+                    matrixFftOutput[i][j] /= numberSamplesThrottle[i]; 
+                }
+            } else if (numberSamplesThrottle[i] == 0) {
+                matrixFftOutput[i] = new Float64Array(fftChunkLength * 2);
+            }
+        }
+console.timeEnd('average');
+
+// Smooth output
+console.time('smooth output');
+        for (var i = 1; i < 99; i++) {
+            for (var j = 1; j < matrixFftOutput[i].length - 1; j++) {
+                matrixFftOutput[i][j] = (matrixFftOutput[i][j] + 
+                                         matrixFftOutput[i - 1][j] + 
+                                         matrixFftOutput[i][j - 1] + 
+                                         matrixFftOutput[i + 1][j] + 
+                                         matrixFftOutput[i][j + 1] ) / 5;
+            }
+        }
+console.timeEnd('smooth output');
+
+        fftThrottleData.fieldIndex = dataBuffer.fieldIndex;
+        fftThrottleData.fftOutput = matrixFftOutput;
+        fftThrottleData.fftLength = fftChunkLength;
+        fftThrottleData.maxNoise = maxNoiseThrottle;
+
+        // Standard graph
 		var fftLength = samples.length;
 		var fftOutput = new Float64Array(fftLength * 2);
 		var fft = new FFT.complex(fftLength, false);
@@ -191,6 +279,99 @@ try {
 		fftData.fftOutput = fftOutput;
 		fftData.maxNoiseIdx = maxNoiseIdx;
 	};
+
+
+	var cachedCanvas = null;
+	
+    var cachedNoiseThrottle = function() {
+
+        if (cachedCanvas == null) {
+            cachedCanvas = document.createElement('canvas');
+
+            var cachedCtx = cachedCanvas.getContext('2d');
+
+            cachedCtx.canvas.width  = fftThrottleData.fftLength;
+            cachedCtx.canvas.height = 100;
+
+            var fftColorScale = analyserZoomY * 100 * 10 / fftThrottleData.maxNoise;
+
+            for(var j = 0; j < 100; j++) {
+                for(var i = 0; i < fftThrottleData.fftLength; i ++) {
+                    let valuePlot = Math.min(fftThrottleData.fftOutput[j][i] * fftColorScale, 1);
+                    if (valuePlot != 0) {
+                        var hue = ((1-valuePlot)*60).toString(10);
+                        var lig = (valuePlot*50).toString(10);
+                        cachedCtx.fillStyle = `hsl(${hue}, 100%, ${lig}%)`;
+                        cachedCtx.fillRect(i, 99 - j, 1, 1);
+                        //console.log('x ' + x + ' y ' + y + ' width ' + barWidth + ' height ' + barHeight + ' color ' + canvasCtx.fillStyle);
+                    }
+                }
+            }
+
+        }
+
+        return cachedCanvas;
+    }
+
+	   /**
+     * Function to actually draw the spectrum analyser overlay
+     * again, need to look at optimisation....
+     **/
+    var drawVsThrottle = function() {
+        canvasCtx.save();
+        canvasCtx.lineWidth = 1;
+        canvasCtx.clearRect(0, 0, canvasCtx.canvas.width, canvasCtx.canvas.height);
+
+canvasCtx.fillStyle = "#101010"; 
+canvasCtx.fillRect(0, 0, canvasCtx.canvas.width, canvasCtx.canvas.height);
+
+        var MARGIN_LEFT   = (isFullscreen)? 35 : 25; // pixels
+        var MARGIN_BOTTOM = 10; // pixels
+        var HEIGHT = canvasCtx.canvas.height - MARGIN_BOTTOM;
+        var WIDTH  = canvasCtx.canvas.width - MARGIN_LEFT;
+        var LEFT   = canvasCtx.canvas.offsetLeft + MARGIN_LEFT;
+        var TOP    = canvasCtx.canvas.offsetTop;
+
+        var PLOTTED_BUFFER_LENGTH = fftThrottleData.fftLength;
+        var PLOTTED_BLACKBOX_RATE = blackBoxRate / (analyserZoomX);
+
+        canvasCtx.translate(LEFT, TOP);
+
+        canvasCtx.fillStyle = "#000000"; 
+        canvasCtx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        canvasCtx.drawImage(cachedNoiseThrottle(), 0, 0, WIDTH, HEIGHT);
+        /*
+        var barWidth  = WIDTH / PLOTTED_BUFFER_LENGTH;
+        var barHeight = HEIGHT / 100;
+
+        var x = 0;
+        var y = 0;
+
+        var fftColorScale = analyserZoomY * 100 * 10 / fftThrottleData.maxNoise;
+console.time('draw vs throttle');
+        for(var j = 0; j < 100; j++) {
+            for(var i = 0; i < PLOTTED_BUFFER_LENGTH; i ++) {
+                let valuePlot = Math.min(fftThrottleData.fftOutput[99 - j][i] * fftColorScale, 1);
+                if (valuePlot != 0) {
+                    var hue = ((1-valuePlot)*60).toString(10);
+                    var lig = (valuePlot*50).toString(10);
+                    canvasCtx.fillStyle = `hsl(${hue}, 100%, ${lig}%)`;
+                    canvasCtx.fillRect(x, y, barWidth + 1, barHeight + 1);
+                    //console.log('x ' + x + ' y ' + y + ' width ' + barWidth + ' height ' + barHeight + ' color ' + canvasCtx.fillStyle);
+                }
+                x += barWidth;
+            }
+            x = 0;
+            y += barHeight;
+        }
+console.timeEnd('draw vs throttle');
+*/
+        drawAxisLabel(dataBuffer.fieldName, WIDTH - 4, HEIGHT - 6, 'right');
+        drawGridLines(PLOTTED_BLACKBOX_RATE, LEFT, TOP, WIDTH, HEIGHT, MARGIN_BOTTOM);
+        drawThrottleLines(LEFT, TOP, WIDTH, HEIGHT, MARGIN_LEFT);
+        canvasCtx.restore();
+    }
 
 	/**
      * Function to actually draw the spectrum analyser overlay
@@ -420,17 +601,38 @@ try {
 		}	
 	};
 
-	var drawAxisLabel = function(axisLabel, X, Y, align) {
+    var drawThrottleLines = function(LEFT, TOP, WIDTH, HEIGHT, MARGIN) {
+
+        const ticks = 5;
+        for(var i=0; i<=ticks; i++) {
+                canvasCtx.beginPath();
+                canvasCtx.lineWidth = 1;
+                canvasCtx.strokeStyle = "rgba(255,255,255,0.25)";
+
+                var verticalPosition = i * (HEIGHT / ticks); 
+                canvasCtx.moveTo(0, verticalPosition);
+                canvasCtx.lineTo(WIDTH, verticalPosition);
+
+                canvasCtx.stroke();
+                var throttleValue = 100 - i*20; 
+                var textBaseline = (i==0)?'top':((i==ticks)?'bottom':'middle');
+                drawAxisLabel(throttleValue + "%", 0, verticalPosition, "right", textBaseline);
+        }   
+    };
+
+	var drawAxisLabel = function(axisLabel, X, Y, align, baseline) {
 			canvasCtx.font = ((isFullscreen)?drawingParams.fontSizeFrameLabelFullscreen:drawingParams.fontSizeFrameLabel) + "pt " + DEFAULT_FONT_FACE;
 			canvasCtx.fillStyle = "rgba(255,255,255,0.9)";
-			if(align) {
+			if (align) {
 				 canvasCtx.textAlign = align;
-				 } else 
-				 {
-				 canvasCtx.textAlign = 'center';
-				 }
-
-
+			} else {
+			    canvasCtx.textAlign = 'center';
+			}
+			if (baseline) {
+			    canvasCtx.textBaseline = baseline;
+			} else {
+			    canvasCtx.textBaseline = 'alphabetic';
+			}
 			canvasCtx.fillText(axisLabel, X, Y);
 		};
 
@@ -452,7 +654,8 @@ try {
 				dataLoad();				
 			}
 			
-			draw(); // draw the analyser on the canvas....
+			//draw(); // draw the analyser on the canvas....
+			drawVsThrottle();
 	};
 
     this.destroy = function() {
@@ -461,7 +664,8 @@ try {
     };
 
     this.refresh = function() {
-    	draw();
+    	//draw();
+    	drawVsThrottle();
     };
 
     /* Add mouse/touch over event to read the frequency */
@@ -482,6 +686,7 @@ try {
     analyserZoomYElem.on('input',
 		function () {
 		analyserZoomY = 1 / (analyserZoomYElem.val() / 100);
+		cachedCanvas = null;
 		that.refresh();
 		}            
 	); analyserZoomYElem.val(100);
